@@ -1,0 +1,9 @@
+.env
+cookie.rc.txt
+incoming/
+salida/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
