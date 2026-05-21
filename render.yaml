@@ -1,0 +1,13 @@
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: certificados
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      - key: REGISTROCIVIL_BUG_CLEAR_ON_START
+        value: "false"
