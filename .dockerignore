@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.git
+.gitignore
+incoming
+salida
+bug
+*.md
+.DS_Store
+cookie.rc.txt

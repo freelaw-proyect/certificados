@@ -4,6 +4,7 @@ uvicorn[standard]>=0.32.0
 httpx>=0.27.0
 pydantic-settings>=2.6.0
 selenium>=4.15.0
-playwright>=1.40.0
+# Debe coincidir con la imagen Docker (mcr.microsoft.com/playwright/python:v1.49.1-noble).
+playwright==1.49.1
 pypdf>=4.0.0
 matplotlib>=3.8.0

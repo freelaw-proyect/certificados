@@ -1,13 +1,19 @@
 # https://render.com/docs/blueprint-spec
+# En el dashboard: Environment = Docker (no "Python native").
 services:
   - type: web
     name: certificados
-    runtime: python
+    runtime: docker
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.12.8"
       - key: REGISTROCIVIL_BUG_CLEAR_ON_START
         value: "false"
+      - key: REGISTROCIVIL_BROWSER_BACKEND
+        value: playwright
+      # reCAPTCHA: en servidor suele hacer falta false; el contenedor sí tiene Chromium.
+      - key: REGISTROCIVIL_WS_BROWSER_HEADLESS
+        value: "false"
+      # Añade en el dashboard: REGISTROCIVIL_COOKIE, DEFAULT_RUN, DEFAULT_EMAIL, etc.
