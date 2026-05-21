@@ -83,18 +83,57 @@ def _pw_img_payload_from_locator(loc: Any) -> dict[str, str]:
 
 
 def _pw_captcha_from_html_src(src: str) -> dict[str, str]:
-    for pat in (
-        r'src\s*=\s*["\'](data:image/[^"\']+base64,[A-Za-z0-9+/=]+)["\']',
-        r'url\s*\(\s*["\']?(data:image/[^"\')\s;]+)["\']?\s*\)',
-    ):
-        m = re.search(pat, src, re.I)
-        if m:
-            return {"image_data_url": m.group(1), "mime": "image/png"}
+    m = re.search(
+        r"data:image/(png|jpeg|jpg|gif);base64,([A-Za-z0-9+/=\s]{80,})",
+        src,
+        re.I | re.S,
+    )
+    if m:
+        ext = m.group(1).lower().replace("jpg", "jpeg")
+        b64 = re.sub(r"\s+", "", m.group(2))
+        mime = f"image/{ext}"
+        return {"image_data_url": f"data:{mime};base64,{b64}", "mime": mime}
+    m2 = re.search(
+        r'src\s*=\s*["\'](data:image/[^"\']+base64,[A-Za-z0-9+/=\s]+)["\']',
+        src,
+        re.I | re.S,
+    )
+    if m2:
+        url = re.sub(r"\s+", "", m2.group(1))
+        return {"image_data_url": url, "mime": "image/png"}
     return {}
 
 
-def _pw_captcha_visual(page: Any) -> dict[str, str]:
-    src = _content(page)
+def _pw_prepare_challenge_page(root: Any) -> None:
+    try:
+        root.wait_for_load_state("domcontentloaded", timeout=20000)
+    except Exception:
+        pass
+    for sel in (
+        'img[src*="base64"]',
+        'img[alt="Red dot"]',
+        'img[alt="red dot"]',
+        "#ans",
+        "input[name='answer']",
+    ):
+        try:
+            root.wait_for_selector(sel, state="visible", timeout=12000)
+            root.wait_for_timeout(600)
+            return
+        except Exception:
+            continue
+    try:
+        root.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    root.wait_for_timeout(1500)
+
+
+def _pw_captcha_visual_on_root(root: Any) -> dict[str, str]:
+    try:
+        src = root.content() or ""
+    except Exception:
+        src = ""
     if _session_ready_to_continue(src) and not _is_captcha_interstitial_html(src):
         return {}
     if not (
@@ -118,14 +157,14 @@ def _pw_captcha_visual(page: Any) -> dict[str, str]:
         "table img",
     ):
         try:
-            out = _pw_img_payload_from_locator(page.locator(sel))
+            out = _pw_img_payload_from_locator(root.locator(sel))
             if out:
                 return out
         except Exception:
             continue
 
     try:
-        for im in page.locator("img").all()[:40]:
+        for im in root.locator("img").all()[:40]:
             try:
                 if not im.is_visible():
                     continue
@@ -161,8 +200,8 @@ def _pw_captcha_visual(page: Any) -> dict[str, str]:
 
     # Captura del área del formulario de desafío (#ans = campo del código)
     try:
-        if page.locator("#ans, input[name='answer']").count():
-            form = page.locator("form").first
+        if root.locator("#ans, input[name='answer']").count():
+            form = root.locator("form").first
             if form.count() and form.is_visible():
                 shot = form.screenshot()
                 if shot:
@@ -176,8 +215,8 @@ def _pw_captcha_visual(page: Any) -> dict[str, str]:
 
     try:
         if _is_rc_waf_or_non_jsf_shell_html(src) or _is_captcha_interstitial_html(src):
-            shot = page.screenshot(type="png", full_page=False)
-            if shot:
+            shot = root.screenshot(type="png", full_page=False)
+            if shot and len(shot) >= 2500:
                 return {
                     "image_base64": base64.b64encode(shot).decode("ascii"),
                     "mime": "image/png",
@@ -187,6 +226,18 @@ def _pw_captcha_visual(page: Any) -> dict[str, str]:
         pass
 
     return {}
+
+
+def _pw_captcha_visual(page: Any) -> dict[str, str]:
+    _pw_prepare_challenge_page(page)
+    for frame in page.frames:
+        try:
+            out = _pw_captcha_visual_on_root(frame)
+            if out.get("image_data_url") or out.get("image_base64"):
+                return out
+        except Exception:
+            continue
+    return _pw_captcha_visual_on_root(page)
 
 
 def _pw_submit_captcha(page: Any, text: str) -> bool:
@@ -308,19 +359,21 @@ def _wait_challenge_pw(
         page.wait_for_timeout(1500)
         vis = _pw_captcha_visual(page)
 
-    if not vis.get("image_data_url") and not vis.get("image_base64"):
+    from rc_captcha_delivery import payload_has_image_data
+
+    if not payload_has_image_data(vis):
         hint = _page_status_hint(_content(page))
         to_client.put(
             (
                 "error",
-                f"{phase}: {hint} — no se pudo enviar la imagen del captcha. "
-                "Prueba de nuevo o usa REGISTROCIVIL_COOKIE.",
+                f"{phase}: {hint} — imagen del captcha vacía o ilegible. "
+                "Reintenta o usa REGISTROCIVIL_COOKIE.",
             )
         )
         return False
 
     cap_note = " (captura pantalla)" if vis.get("capture") else ""
-    to_client.put(("log", f"{phase}: imagen del desafío enviada a esta página{cap_note}."))
+    to_client.put(("log", f"{phase}: imagen del desafío lista ({cap_note or 'extraída'})."))
     to_client.put(("captcha", {"phase": phase, **vis}))
     while time.monotonic() < end:
         if ready():

@@ -26,7 +26,7 @@ from urllib.parse import urlencode, urljoin
 
 import httpx
 from fastapi import FastAPI, File, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -1832,6 +1832,22 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/captcha/{token}")
+def captcha_image(token: str) -> Response:
+    """Imagen del desafío RC (evita mandar base64 gigante por WebSocket)."""
+    from rc_captcha_delivery import get_captcha_bytes
+
+    got = get_captcha_bytes(token.strip())
+    if not got:
+        raise HTTPException(status_code=404, detail="Captcha no encontrado o expirado")
+    data, mime = got
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def _email2json_inbox_path() -> Path:
     raw = (settings.email2json_inbox_dir or "incoming").strip() or "incoming"
     p = Path(raw)
@@ -2150,7 +2166,7 @@ def _root_html() -> str:
     label {{ display: block; font-weight: 600; margin-bottom: 0.35rem; }}
     #runRut {{ width: 100%; max-width: 22rem; padding: 0.55rem; font-size: 1.1rem; margin-bottom: 1rem; }}
     #captchaBox {{ display: none; margin: 1rem 0; padding: 1rem; border: 1px solid #ccc; border-radius: 8px; background: #fafafa; }}
-    #captchaBox img {{ max-width: 100%; height: auto; border: 1px solid #888; display: block; margin-bottom: 0.75rem; }}
+    #captchaBox img {{ max-width: 100%; min-height: 4rem; height: auto; border: 1px solid #888; display: block; margin-bottom: 0.75rem; background: #eee; }}
     #code {{ width: 100%; max-width: 22rem; padding: 0.55rem; font-size: 1.1rem; margin: 0.5rem 0; }}
     #log {{ white-space: pre-wrap; background: #111; color: #cfc; padding: 0.75rem; border-radius: 6px; min-height: 5rem; font-size: 0.85rem; }}
     .err {{ color: #f88; }}
@@ -2234,14 +2250,21 @@ def _root_html() -> str:
         if (msg.type === "captcha") {{
           capBox.style.display = "block";
           alertBox.style.display = "none";
-          if (msg.image_data_url) {{
-            capImg.src = msg.image_data_url;
-          }} else {{
-            capImg.src = "data:image/png;base64," + (msg.image_base64 || "");
+          let src = "";
+          if (msg.image_url) {{
+            src = msg.image_url.startsWith("http") ? msg.image_url : (location.origin + msg.image_url);
+            src += (src.indexOf("?") >= 0 ? "&" : "?") + "t=" + Date.now();
+          }} else if (msg.image_data_url) {{
+            src = msg.image_data_url;
+          }} else if (msg.image_base64) {{
+            src = "data:image/png;base64," + msg.image_base64;
           }}
+          capImg.onerror = () => log("No se pudo mostrar la imagen del desafío.", "err");
+          capImg.onload = () => log("Imagen del desafío visible. Escribe el código y pulsa «Enviar código».", "ok");
+          capImg.src = src || "";
           codeEl.value = "";
           codeEl.focus();
-          log("Ingresa el código de la imagen y pulsa «Enviar código».");
+          if (!src) log("El servidor no envió URL de imagen.", "err");
           return;
         }}
         if (msg.type === "manual_challenge") {{
@@ -2449,8 +2472,20 @@ async def ws_entrega_certificado(websocket: WebSocket) -> None:
             if kind == "log":
                 await websocket.send_json({"type": "log", "message": str(data)})
             elif kind == "captcha":
+                from rc_captcha_delivery import register_captcha_for_browser
+
                 payload = data if isinstance(data, dict) else {}
-                await websocket.send_json({"type": "captcha", **payload})
+                ws_payload = register_captcha_for_browser(payload)
+                if not ws_payload:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "message": "Imagen del captcha vacía; reintenta o usa REGISTROCIVIL_COOKIE.",
+                        }
+                    )
+                    await websocket.close()
+                    return
+                await websocket.send_json(ws_payload)
                 raw = await asyncio.wait_for(
                     websocket.receive_text(),
                     timeout=float(min(600, max(120, settings.selenium_manual_captcha_timeout_sec + 60))),
