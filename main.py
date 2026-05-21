@@ -2405,6 +2405,55 @@ async def ws_entrega_certificado(websocket: WebSocket) -> None:
         await websocket.close()
         return
 
+    env_cookie = _load_cookie_from_env_or_file()
+    if env_cookie:
+        await websocket.send_json(
+            {
+                "type": "log",
+                "message": "REGISTROCIVIL_COOKIE detectada: flujo HTTP (sin abrir Chromium).",
+            }
+        )
+        run_consulta = settings.default_carro_run_consulta.strip() or run
+        run_solicitante = settings.default_carro_run_solicitante.strip() or run
+        filtro = settings.default_filtro.strip()
+        try:
+            payload = await asyncio.to_thread(
+                _http_entrega_phase,
+                env_cookie,
+                run=run,
+                run_raw=run_raw,
+                run_normalizado_aviso=run_normalizado_aviso,
+                email=email,
+                numero=numero,
+                run_consulta=run_consulta,
+                run_solicitante=run_solicitante,
+                filtro=filtro,
+                selenium_used=False,
+                cookie_origin="env",
+                selenium_fallback_to_env_cookie=False,
+                selenium_error=None,
+                skip_http_repeat_agregar=False,
+            )
+            await websocket.send_json({"type": "done", "result": payload})
+        except Exception as e:
+            await websocket.send_json({"type": "error", "message": f"{type(e).__name__}: {e}"})
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        return
+
+    if (os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID") or "").strip():
+        await websocket.send_json(
+            {
+                "type": "log",
+                "message": (
+                    "Sin REGISTROCIVIL_COOKIE en Render: el WAF del RC suele bloquear Chromium. "
+                    "Tras resolver el desafío en tu PC, pega la cookie en Environment del servicio."
+                ),
+            }
+        )
+
     to_client: queue.Queue[tuple[str, Any]] = queue.Queue()
     from_client: queue.Queue[tuple[str, Any]] = queue.Queue()
     pack_specs: list[tuple[str, str]] | None = None
