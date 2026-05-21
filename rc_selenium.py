@@ -178,6 +178,69 @@ def _is_captcha_interstitial_html(src: str) -> bool:
     )
 
 
+def _is_waf_error_page_html(src: str) -> bool:
+    """
+    Pantalla de fallo F5/TSPD (p. ej. «Oops… something went wrong», support id).
+    No es el captcha con código de imagen; no debe mostrarse como desafío al usuario.
+    """
+    if not src:
+        return False
+    low = src.lower()
+    if _session_ready_to_continue(src) or _is_captcha_interstitial_html(src):
+        return False
+    if "oops" in low and ("something went wrong" in low or "went wrong" in low):
+        return True
+    if "support id is" in low and "código de la imagen" not in low and "codigo de la imagen" not in low:
+        return True
+    if "failureconfig" in low and "#ans" not in low and "name='answer'" not in low:
+        return True
+    return False
+
+
+def load_registrocivil_cookie_from_env() -> str:
+    """Cookie de sesión desde REGISTROCIVIL_COOKIE o REGISTROCIVIL_COOKIE_FILE."""
+    raw = (os.environ.get("REGISTROCIVIL_COOKIE") or "").strip()
+    if raw:
+        return raw
+    path_raw = (os.environ.get("REGISTROCIVIL_COOKIE_FILE") or "").strip()
+    if not path_raw:
+        return ""
+    path = path_raw if os.path.isabs(path_raw) else os.path.join(os.getcwd(), path_raw)
+    try:
+        line = open(path, encoding="utf-8", errors="replace").readline().strip()
+    except OSError:
+        return ""
+    if line.lower().startswith("cookie:"):
+        line = line.split(":", 1)[1].strip()
+    return line
+
+
+def cookie_header_to_playwright_cookies(
+    cookie_header: str,
+    *,
+    domain: str = ".registrocivil.cl",
+) -> list[dict[str, Any]]:
+    """Convierte cabecera Cookie a lista para ``context.add_cookies``."""
+    out: list[dict[str, Any]] = []
+    for raw in (cookie_header or "").split(";"):
+        part = raw.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        name, value = name.strip(), value.strip()
+        if not name:
+            continue
+        out.append(
+            {
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": "/",
+            }
+        )
+    return out
+
+
 def _page_ready(driver: Any) -> bool:
     """True cuando parece haber pasado el challenge TSPD y hay app JSF o formulario."""
     src = driver.page_source

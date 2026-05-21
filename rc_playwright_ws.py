@@ -18,6 +18,7 @@ from urllib.parse import urlencode
 
 from rc_selenium import (
     OFICINA,
+    REF_SERVICIOS_LINEA,
     UA_CHROME,
     _cart_has_certificate_items,
     _challenge_requires_user_in_browser,
@@ -26,9 +27,12 @@ from rc_selenium import (
     _is_captcha_interstitial_html,
     _is_recaptcha_html,
     _is_rc_waf_or_non_jsf_shell_html,
+    _is_waf_error_page_html,
     _maybe_recover_short_html,
     _session_ready_to_continue,
+    cookie_header_to_playwright_cookies,
     extract_rc_div_id_error_message,
+    load_registrocivil_cookie_from_env,
     _rc_error_element_visible,
 )
 
@@ -51,6 +55,8 @@ def _page_status_hint(src: str) -> str:
         return "HTML vacío"
     if _session_ready_to_continue(src):
         return "carrito listo"
+    if _is_waf_error_page_html(src):
+        return "WAF bloqueó la sesión (error del servidor)"
     if _is_recaptcha_html(src):
         return "reCAPTCHA"
     if _is_captcha_interstitial_html(src):
@@ -58,6 +64,17 @@ def _page_status_hint(src: str) -> str:
     if _is_rc_waf_or_non_jsf_shell_html(src):
         return "WAF/desafío"
     return f"esperando ({len(src)} bytes)"
+
+
+def _pw_has_captcha_answer_field(root: Any) -> bool:
+    try:
+        for sel in ("#ans", "input[name='answer']"):
+            loc = root.locator(sel).first
+            if loc.count() and loc.is_visible():
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _content(page: Any) -> str:
@@ -136,12 +153,17 @@ def _pw_captcha_visual_on_root(root: Any) -> dict[str, str]:
         src = ""
     if _session_ready_to_continue(src) and not _is_captcha_interstitial_html(src):
         return {}
+    if _is_waf_error_page_html(src):
+        return {}
     if not (
         _is_captcha_interstitial_html(src)
         or _is_recaptcha_html(src)
         or (_is_rc_waf_or_non_jsf_shell_html(src) and not _session_ready_to_continue(src))
     ):
         return {}
+
+    has_code_field = _pw_has_captcha_answer_field(root)
+    real_captcha_page = _is_captcha_interstitial_html(src) or has_code_field
 
     from_html = _pw_captcha_from_html_src(src)
     if from_html:
@@ -198,32 +220,32 @@ def _pw_captcha_visual_on_root(root: Any) -> dict[str, str]:
     except Exception:
         pass
 
-    # Captura del área del formulario de desafío (#ans = campo del código)
-    try:
-        if root.locator("#ans, input[name='answer']").count():
-            form = root.locator("form").first
-            if form.count() and form.is_visible():
-                shot = form.screenshot()
-                if shot:
+    # Solo captura de formulario/viewport si hay captcha real (evita «Oops… support id»).
+    if real_captcha_page:
+        try:
+            if has_code_field:
+                form = root.locator("form").first
+                if form.count() and form.is_visible():
+                    shot = form.screenshot()
+                    if shot and len(shot) >= 1200:
+                        return {
+                            "image_base64": base64.b64encode(shot).decode("ascii"),
+                            "mime": "image/png",
+                            "capture": "form",
+                        }
+        except Exception:
+            pass
+        if _is_captcha_interstitial_html(src):
+            try:
+                shot = root.screenshot(type="png", full_page=False)
+                if shot and len(shot) >= 2500:
                     return {
                         "image_base64": base64.b64encode(shot).decode("ascii"),
                         "mime": "image/png",
-                        "capture": "form",
+                        "capture": "viewport",
                     }
-    except Exception:
-        pass
-
-    try:
-        if _is_rc_waf_or_non_jsf_shell_html(src) or _is_captcha_interstitial_html(src):
-            shot = root.screenshot(type="png", full_page=False)
-            if shot and len(shot) >= 2500:
-                return {
-                    "image_base64": base64.b64encode(shot).decode("ascii"),
-                    "mime": "image/png",
-                    "capture": "viewport",
-                }
-    except Exception:
-        pass
+            except Exception:
+                pass
 
     return {}
 
@@ -282,6 +304,19 @@ def _pw_submit_captcha(page: Any, text: str) -> bool:
         return False
 
 
+def _pw_reload_carro(page: Any, url_carro: str) -> None:
+    try:
+        page.goto(REF_SERVICIOS_LINEA, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(800)
+    except Exception:
+        pass
+    try:
+        page.goto(url_carro, wait_until="domcontentloaded", timeout=90000)
+    except Exception:
+        pass
+    page.wait_for_timeout(2000)
+
+
 def _wait_challenge_pw(
     page: Any,
     to_client: "queue.Queue[tuple[str, Any]]",
@@ -291,8 +326,10 @@ def _wait_challenge_pw(
     deadline: float,
     answer_timeout_sec: float,
     headless: bool,
+    url_carro: str = "",
 ) -> bool:
     end = time.monotonic() + answer_timeout_sec
+    waf_error_retries = 0
 
     def ready() -> bool:
         return _session_ready_to_continue(_content(page))
@@ -305,10 +342,33 @@ def _wait_challenge_pw(
     while time.monotonic() < end:
         if ready():
             return True
+        src = _content(page)
+        if _is_waf_error_page_html(src):
+            waf_error_retries += 1
+            if waf_error_retries <= 2 and url_carro:
+                to_client.put(
+                    (
+                        "log",
+                        f"{phase}: el WAF devolvió error del servidor (no es captcha); "
+                        f"reintentando ({waf_error_retries}/2)…",
+                    )
+                )
+                _pw_reload_carro(page, url_carro)
+                continue
+            to_client.put(
+                (
+                    "error",
+                    f"{phase}: el Registro Civil bloqueó la sesión en este servidor "
+                    "(«Oops… something went wrong»). En Render suele fallar el WAF automático. "
+                    "Pega REGISTROCIVIL_COOKIE en variables de entorno (resuélvelo en tu PC en "
+                    "registrocivil.cl) o ejecuta en local.",
+                )
+            )
+            return False
         vis = _pw_captcha_visual(page)
         if vis.get("image_data_url") or vis.get("image_base64"):
             break
-        if _is_recaptcha_html(_content(page)):
+        if _is_recaptcha_html(src):
             if headless or _remote_deploy():
                 to_client.put(
                     (
@@ -362,14 +422,24 @@ def _wait_challenge_pw(
     from rc_captcha_delivery import payload_has_image_data
 
     if not payload_has_image_data(vis):
-        hint = _page_status_hint(_content(page))
-        to_client.put(
-            (
-                "error",
-                f"{phase}: {hint} — imagen del captcha vacía o ilegible. "
-                "Reintenta o usa REGISTROCIVIL_COOKIE.",
+        src = _content(page)
+        hint = _page_status_hint(src)
+        if _is_waf_error_page_html(src):
+            to_client.put(
+                (
+                    "error",
+                    f"{phase}: el WAF bloqueó la sesión (no hay captcha que resolver). "
+                    "Pega REGISTROCIVIL_COOKIE en Render o ejecuta en local.",
+                )
             )
-        )
+        else:
+            to_client.put(
+                (
+                    "error",
+                    f"{phase}: {hint} — imagen del captcha vacía o ilegible. "
+                    "Reintenta o usa REGISTROCIVIL_COOKIE.",
+                )
+            )
         return False
 
     cap_note = " (captura pantalla)" if vis.get("capture") else ""
@@ -410,6 +480,7 @@ def _poll_until_ready_pw(
     phase: str,
     answer_timeout_sec: float,
     headless: bool,
+    url_carro: str = "",
 ) -> bool:
     last_ping = 0.0
     while time.monotonic() < deadline:
@@ -432,6 +503,7 @@ def _poll_until_ready_pw(
                 deadline=deadline,
                 answer_timeout_sec=answer_timeout_sec,
                 headless=headless,
+                url_carro=url_carro,
             ):
                 return False
             continue
@@ -582,6 +654,15 @@ def fetch_cookie_header_via_chrome_interactive(
             viewport={"width": 1280, "height": 900},
         )
         context.set_default_timeout(int((wait_jsf + 60) * 1000))
+        env_cookie = load_registrocivil_cookie_from_env()
+        if env_cookie:
+            try:
+                pw_cookies = cookie_header_to_playwright_cookies(env_cookie)
+                if pw_cookies:
+                    context.add_cookies(pw_cookies)
+                    to_client.put(("log", "Cookie REGISTROCIVIL_COOKIE inyectada en Chromium."))
+            except Exception as e:
+                to_client.put(("log", f"No se pudo inyectar cookie del .env: {type(e).__name__}"))
         page = context.new_page()
         try:
             if not headless:
@@ -596,6 +677,8 @@ def fetch_cookie_header_via_chrome_interactive(
 
             to_client.put(("log", "Abriendo carro.srcei (en Render puede tardar 30–90 s)…"))
             try:
+                page.goto(REF_SERVICIOS_LINEA, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(600)
                 page.goto(
                     url_carro,
                     wait_until="domcontentloaded",
@@ -614,6 +697,7 @@ def fetch_cookie_header_via_chrome_interactive(
                 phase="carro_inicio",
                 answer_timeout_sec=answer_timeout,
                 headless=headless,
+                url_carro=url_carro,
             ):
                 return {"cookies": "", "entrega_ok": False, "entrega_detail": "Captcha/sesión RC"}
 
@@ -639,6 +723,7 @@ def fetch_cookie_header_via_chrome_interactive(
                 phase="carro",
                 answer_timeout_sec=answer_timeout,
                 headless=headless,
+                url_carro=url_carro,
             )
             _maybe_recover_short_html_pw(page, wait_jsf)
 
