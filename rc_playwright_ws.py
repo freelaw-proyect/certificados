@@ -35,6 +35,29 @@ def _stderr(msg: str) -> None:
     print(f"[registrocivil-pw] {msg}", file=sys.stderr, flush=True)
 
 
+def _remote_deploy() -> bool:
+    """Render y otros PaaS: el Chromium no es visible para el usuario en el navegador."""
+    return bool(
+        (os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID") or "").strip()
+        or (os.environ.get("REGISTROCIVIL_REMOTE_DEPLOY") or "").strip().lower()
+        in ("true", "1", "yes")
+    )
+
+
+def _page_status_hint(src: str) -> str:
+    if not src:
+        return "HTML vacío"
+    if _session_ready_to_continue(src):
+        return "carrito listo"
+    if _is_recaptcha_html(src):
+        return "reCAPTCHA"
+    if _is_captcha_interstitial_html(src):
+        return "captcha imagen"
+    if _is_rc_waf_or_non_jsf_shell_html(src):
+        return "WAF/desafío"
+    return f"esperando ({len(src)} bytes)"
+
+
 def _content(page: Any) -> str:
     try:
         return page.content() or ""
@@ -143,12 +166,14 @@ def _wait_challenge_pw(
         if vis.get("image_data_url") or vis.get("image_base64"):
             break
         if _is_recaptcha_html(_content(page)):
-            if headless:
+            if headless or _remote_deploy():
                 to_client.put(
                     (
                         "error",
-                        f"{phase}: reCAPTCHA detectado con navegador headless. "
-                        "Pon REGISTROCIVIL_WS_BROWSER_HEADLESS=false en .env y reinicia uvicorn.",
+                        f"{phase}: reCAPTCHA en el Registro Civil. "
+                        "En Render el navegador corre en el servidor (no hay ventana que puedas usar). "
+                        "Pega REGISTROCIVIL_COOKIE en variables de entorno (resuélvelo en tu PC en "
+                        "registrocivil.cl) o ejecuta la app en local http://127.0.0.1:8765.",
                     )
                 )
                 return False
@@ -158,15 +183,26 @@ def _wait_challenge_pw(
                     {
                         "phase": phase,
                         "kind": "recaptcha",
-                        "message": f"{phase}: resuelve el reCAPTCHA en la ventana de Chromium (Playwright).",
+                        "message": f"{phase}: resuelve el reCAPTCHA en la ventana de Chromium (solo en local).",
                     },
                 )
             )
+            last_ping = 0.0
             while time.monotonic() < deadline:
                 if not _challenge_requires_user_in_browser(_content(page)):
                     to_client.put(("log", f"{phase}: reCAPTCHA superado."))
                     return True
+                now = time.monotonic()
+                if now - last_ping >= 20.0:
+                    to_client.put(
+                        (
+                            "log",
+                            f"{phase}: sigue reCAPTCHA — marca la casilla en la ventana de Chromium…",
+                        )
+                    )
+                    last_ping = now
                 time.sleep(0.45)
+            to_client.put(("error", f"{phase}: timeout esperando reCAPTCHA."))
             return False
         time.sleep(0.45)
 
@@ -214,8 +250,13 @@ def _poll_until_ready_pw(
     answer_timeout_sec: float,
     headless: bool,
 ) -> bool:
+    last_ping = 0.0
     while time.monotonic() < deadline:
         src = _content(page)
+        now = time.monotonic()
+        if now - last_ping >= 12.0:
+            to_client.put(("log", f"{phase}: {_page_status_hint(src)}…"))
+            last_ping = now
         if _session_ready_to_continue(src):
             if phase == "agregarACarro" and _is_agregar_iframe_shell_html(src):
                 to_client.put(("log", f"{phase}: iframe agregar listo ({len(src)} bytes)."))
@@ -392,9 +433,18 @@ def fetch_cookie_header_via_chrome_interactive(
             else:
                 to_client.put(("log", "Playwright headless: captcha por imagen en esta página si aplica."))
 
-            to_client.put(("log", "Abriendo carro.srcei…"))
-            page.goto(url_carro, wait_until="domcontentloaded")
-            page.wait_for_timeout(1000)
+            to_client.put(("log", "Abriendo carro.srcei (en Render puede tardar 30–90 s)…"))
+            try:
+                page.goto(
+                    url_carro,
+                    wait_until="domcontentloaded",
+                    timeout=int(min(120, wait_jsf) * 1000),
+                )
+            except Exception as e:
+                to_client.put(("error", f"carro.srcei no cargó: {type(e).__name__}: {e}"))
+                return {"cookies": "", "entrega_ok": False, "entrega_detail": str(e)}
+            page.wait_for_timeout(1500)
+            to_client.put(("log", f"carro cargado ({len(_content(page))} bytes HTML)."))
             if not _poll_until_ready_pw(
                 page,
                 to_client,
