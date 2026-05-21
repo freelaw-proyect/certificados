@@ -1,5 +1,6 @@
 .env
 cookie.rc.txt
+session.rc.json
 incoming/
 salida/
 .venv/

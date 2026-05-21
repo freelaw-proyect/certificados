@@ -81,6 +81,11 @@ class Settings(BaseSettings):
     default_pack_union_civil_entrega_variant: str = "matrimonio"
     # WebSocket /: token opcional (?token=) para no exponer el flujo en red abierta.
     ws_token: str = ""
+    # POST /registrocivil/session (script local → Render). Si vacío, se usa ws_token.
+    session_token: str = ""
+    session_ttl_sec: int = 7200
+    # Persistencia opcional (sobrevive reinicios del mismo contenedor; Render efímero).
+    session_file: str = "session.rc.json"
     # En el flujo WS: false = Chrome visible (mejor para depurar y para capturar el img del desafío).
     ws_selenium_headless: bool = False
     # Headless del navegador en WebSocket (Playwright: true recomendado; Selenium: a menudo falla el WAF)
@@ -133,6 +138,43 @@ class EntregaCertificadoIn(BaseModel):
     cookie: str | None = None
 
 
+class RegistroCivilSessionIn(BaseModel):
+    """Cookie obtenida en local (Chrome) para que el API en Render la use sin navegador."""
+
+    cookie: str
+    ttl_sec: int | None = None
+    source: str | None = None
+    run: str | None = None
+
+
+def _session_persist_path() -> Path | None:
+    raw = (settings.session_file or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    return p if p.is_absolute() else Path(__file__).resolve().parent / p
+
+
+def _session_api_token() -> str:
+    return (settings.session_token or settings.ws_token or "").strip()
+
+
+def _verify_session_api_token(
+    x_registrocivil_session_token: str | None = None,
+    authorization: str | None = None,
+) -> None:
+    expected = _session_api_token()
+    if not expected:
+        return
+    got = (x_registrocivil_session_token or "").strip()
+    if not got and authorization:
+        low = authorization.strip().lower()
+        if low.startswith("bearer "):
+            got = authorization.strip()[7:].strip()
+    if got != expected:
+        raise HTTPException(status_code=401, detail="Token de sesión inválido")
+
+
 def _load_cookie_from_env_or_file() -> str:
     raw = (settings.cookie or "").strip()
     if raw:
@@ -149,27 +191,53 @@ def _load_cookie_from_env_or_file() -> str:
     return line
 
 
+def _load_cookie_from_session_store() -> str:
+    from rc_session_store import get_active_cookie
+
+    return get_active_cookie()
+
+
+def _resolve_cookie_from_request(
+    x_registrocivil_cookie: str | None,
+    body_cookie: str | None,
+    *,
+    extra_cookie: str | None = None,
+) -> tuple[str, str]:
+    """
+    Orden: cabecera → body → extra (p. ej. WS start) → .env → sesión POST /registrocivil/session.
+    Devuelve (cookie, origin).
+    """
+    had_header = bool((x_registrocivil_cookie or "").strip())
+    if (x_registrocivil_cookie or "").strip():
+        return (x_registrocivil_cookie or "").strip(), "header"
+    if (body_cookie or "").strip():
+        return (body_cookie or "").strip(), "body"
+    if (extra_cookie or "").strip():
+        return (extra_cookie or "").strip(), "ws_start"
+    env = _load_cookie_from_env_or_file()
+    if env:
+        return env, "env"
+    stored = _load_cookie_from_session_store()
+    if stored:
+        return stored, "session_store"
+    return "", "none"
+
+
 def _resolve_registrocivil_cookie(
     x_registrocivil_cookie: str | None,
     body_cookie: str | None,
 ) -> tuple[str, bool, bool, str | None, str]:
     """
-    Orden: cabecera X-RegistroCivil-Cookie → body.cookie → REGISTROCIVIL_COOKIE / cookie_file
-    → Selenium (solo si sigue vacío y USE_SELENIUM=true).
+    Orden: cabecera → body → env → sesión en memoria → Selenium (si USE_SELENIUM=true).
 
     Devuelve (cookie, had_header, selenium_used, selenium_error, cookie_origin).
     """
     had_header = bool((x_registrocivil_cookie or "").strip())
-    cookie = (
-        (x_registrocivil_cookie or "").strip()
-        or (body_cookie or "").strip()
-        or _load_cookie_from_env_or_file()
-    )
+    cookie, origin = _resolve_cookie_from_request(x_registrocivil_cookie, body_cookie)
     selenium_used = False
     selenium_error: str | None = None
 
     if cookie:
-        origin = "header" if had_header else ("body" if (body_cookie or "").strip() else "env")
         return cookie, had_header, selenium_used, selenium_error, origin
 
     if not settings.use_selenium:
@@ -1821,6 +1889,13 @@ async def _lifespan(app: FastAPI):
         _clear_bug_dir()
     else:
         bug_dir().mkdir(parents=True, exist_ok=True)
+    from rc_session_store import configure_persist_path, load_from_disk
+
+    path = _session_persist_path()
+    if path:
+        configure_persist_path(path)
+        if load_from_disk(path):
+            print(f"[registrocivil] Sesión RC cargada desde {path}", file=sys.stderr, flush=True)
     yield
 
 
@@ -1830,6 +1905,58 @@ app = FastAPI(title="certificados", version="0.1.0", lifespan=_lifespan)
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/registrocivil/session")
+def registrocivil_session_status() -> dict[str, Any]:
+    """Estado de la sesión subida por el script local (sin exponer la cookie completa)."""
+    from rc_session_store import session_status
+
+    st = session_status()
+    st["token_required"] = bool(_session_api_token())
+    return st
+
+
+@app.post("/registrocivil/session")
+def registrocivil_session_register(
+    payload: RegistroCivilSessionIn,
+    x_registrocivil_session_token: str | None = Header(
+        default=None, alias="X-RegistroCivil-Session-Token"
+    ),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """
+    Registra cookie RC obtenida en tu Mac (``scripts/registrocivil_cookie_local.py``).
+
+    El servidor en Render la usa para httpx sin abrir Chromium hasta que expire (TTL).
+    """
+    _verify_session_api_token(x_registrocivil_session_token, authorization)
+    from rc_session_store import set_session
+
+    ttl = float(payload.ttl_sec if payload.ttl_sec is not None else settings.session_ttl_sec)
+    try:
+        return set_session(
+            payload.cookie,
+            ttl_sec=ttl,
+            source=(payload.source or "api").strip(),
+            run=(payload.run or "").strip(),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.delete("/registrocivil/session")
+def registrocivil_session_clear(
+    x_registrocivil_session_token: str | None = Header(
+        default=None, alias="X-RegistroCivil-Session-Token"
+    ),
+    authorization: str | None = Header(default=None),
+) -> dict[str, str]:
+    _verify_session_api_token(x_registrocivil_session_token, authorization)
+    from rc_session_store import clear_session
+
+    clear_session()
+    return {"ok": True, "message": "Sesión RC eliminada"}
 
 
 @app.get("/api/captcha/{token}")
@@ -2144,6 +2271,12 @@ def entrega_certificado(
 def _root_html() -> str:
     run_default = settings.default_run.strip()
     email = settings.default_email.strip() or "(define REGISTROCIVIL_DEFAULT_EMAIL)"
+    api_public = (
+        (os.environ.get("REGISTROCIVIL_PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "")
+        .strip()
+        .rstrip("/")
+        or "https://TU-SERVICIO.onrender.com"
+    )
     if settings.default_pack_tres_certificados:
         cert = _pack_ui_label()
     else:
@@ -2184,6 +2317,12 @@ def _root_html() -> str:
   <p>
     Pulsa iniciar: si aparece la <strong>imagen del desafío</strong> abajo, escribe el código y envía.
     Si es <strong>reCAPTCHA</strong>, complétalo en Chromium (en servidor va en headless). Tipos del pack que no apliquen al RUN no detienen el resto.
+  </p>
+  <p class="meta">
+    <strong>Render / sin captcha en servidor:</strong> en tu Mac ejecuta
+    <code>python scripts/registrocivil_cookie_local.py --api-url {api_public}</code>
+    (Chrome local → sube sesión). Luego inicia aquí otra vez.
+    Estado: <a href="/registrocivil/session">GET /registrocivil/session</a>
   </p>
   <p><button type="button" id="go">Iniciar solicitud</button></p>
   <div id="captchaBox">
@@ -2405,12 +2544,18 @@ async def ws_entrega_certificado(websocket: WebSocket) -> None:
         await websocket.close()
         return
 
-    env_cookie = _load_cookie_from_env_or_file()
-    if env_cookie:
+    start_cookie = (start_obj.get("cookie") or "").strip()
+    static_cookie, cookie_origin = _resolve_cookie_from_request(None, None, extra_cookie=start_cookie)
+    if static_cookie:
+        origin_msg = {
+            "env": "REGISTROCIVIL_COOKIE",
+            "session_store": "sesión subida (POST /registrocivil/session)",
+            "ws_start": "cookie en mensaje start",
+        }.get(cookie_origin, cookie_origin)
         await websocket.send_json(
             {
                 "type": "log",
-                "message": "REGISTROCIVIL_COOKIE detectada: flujo HTTP (sin abrir Chromium).",
+                "message": f"{origin_msg}: flujo HTTP (sin abrir Chromium).",
             }
         )
         run_consulta = settings.default_carro_run_consulta.strip() or run
@@ -2419,7 +2564,7 @@ async def ws_entrega_certificado(websocket: WebSocket) -> None:
         try:
             payload = await asyncio.to_thread(
                 _http_entrega_phase,
-                env_cookie,
+                static_cookie,
                 run=run,
                 run_raw=run_raw,
                 run_normalizado_aviso=run_normalizado_aviso,
@@ -2429,7 +2574,7 @@ async def ws_entrega_certificado(websocket: WebSocket) -> None:
                 run_solicitante=run_solicitante,
                 filtro=filtro,
                 selenium_used=False,
-                cookie_origin="env",
+                cookie_origin=cookie_origin,
                 selenium_fallback_to_env_cookie=False,
                 selenium_error=None,
                 skip_http_repeat_agregar=False,
@@ -2448,8 +2593,10 @@ async def ws_entrega_certificado(websocket: WebSocket) -> None:
             {
                 "type": "log",
                 "message": (
-                    "Sin REGISTROCIVIL_COOKIE en Render: el WAF del RC suele bloquear Chromium. "
-                    "Tras resolver el desafío en tu PC, pega la cookie en Environment del servicio."
+                    "Sin cookie en el servidor: en tu Mac ejecuta "
+                    "python scripts/registrocivil_cookie_local.py --api-url "
+                    + str(websocket.url).replace("wss:", "https:").replace("ws:", "http:").split("/ws/")[0]
+                    + " (abre Chrome, resuelve captcha, sube sesión). Luego pulsa Iniciar de nuevo."
                 ),
             }
         )

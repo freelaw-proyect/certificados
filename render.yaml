@@ -16,4 +16,5 @@ services:
       # reCAPTCHA: en servidor suele hacer falta false; el contenedor sí tiene Chromium.
       - key: REGISTROCIVIL_WS_BROWSER_HEADLESS
         value: "true"
-      # Añade en el dashboard: REGISTROCIVIL_COOKIE, DEFAULT_RUN, DEFAULT_EMAIL, etc.
+      # Añade: REGISTROCIVIL_SESSION_TOKEN, DEFAULT_RUN, DEFAULT_EMAIL, etc.
+      # Cookie dinámica: script local → POST /registrocivil/session (ver scripts/registrocivil_cookie_local.py)
