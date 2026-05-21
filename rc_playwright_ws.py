@@ -7,8 +7,10 @@ y hay que resolver en la ventana del navegador (o usar REGISTROCIVIL_WS_BROWSER_
 
 from __future__ import annotations
 
+import base64
 import os
 import queue
+import re
 import sys
 import time
 from typing import Any
@@ -65,6 +67,32 @@ def _content(page: Any) -> str:
         return ""
 
 
+def _pw_img_payload_from_locator(loc: Any) -> dict[str, str]:
+    try:
+        if not loc.count() or not loc.first.is_visible():
+            return {}
+        src_attr = (loc.first.get_attribute("src") or "").strip()
+        if src_attr.startswith("data:image/") and "base64," in src_attr:
+            return {"image_data_url": src_attr, "mime": "image/png"}
+        shot = loc.first.screenshot()
+        if shot:
+            return {"image_base64": base64.b64encode(shot).decode("ascii"), "mime": "image/png"}
+    except Exception:
+        pass
+    return {}
+
+
+def _pw_captcha_from_html_src(src: str) -> dict[str, str]:
+    for pat in (
+        r'src\s*=\s*["\'](data:image/[^"\']+base64,[A-Za-z0-9+/=]+)["\']',
+        r'url\s*\(\s*["\']?(data:image/[^"\')\s;]+)["\']?\s*\)',
+    ):
+        m = re.search(pat, src, re.I)
+        if m:
+            return {"image_data_url": m.group(1), "mime": "image/png"}
+    return {}
+
+
 def _pw_captcha_visual(page: Any) -> dict[str, str]:
     src = _content(page)
     if _session_ready_to_continue(src) and not _is_captcha_interstitial_html(src):
@@ -75,25 +103,89 @@ def _pw_captcha_visual(page: Any) -> dict[str, str]:
         or (_is_rc_waf_or_non_jsf_shell_html(src) and not _session_ready_to_continue(src))
     ):
         return {}
-    try:
-        loc = page.locator('img[alt="Red dot"]')
-        if loc.count() and loc.first.is_visible():
-            src_attr = loc.first.get_attribute("src") or ""
-            if src_attr.startswith("data:image"):
-                return {"image_data_url": src_attr, "mime": "image/png"}
-    except Exception:
-        pass
-    try:
-        shot = page.locator('img[alt="Red dot"]').first.screenshot()
-        if shot:
-            import base64
 
-            return {
-                "image_base64": base64.b64encode(shot).decode("ascii"),
-                "mime": "image/png",
-            }
+    from_html = _pw_captcha_from_html_src(src)
+    if from_html:
+        return from_html
+
+    for sel in (
+        'img[alt="Red dot"]',
+        'img[alt="red dot"]',
+        "#captcha img",
+        "img.captcha",
+        "img#captcha",
+        "form img",
+        "table img",
+    ):
+        try:
+            out = _pw_img_payload_from_locator(page.locator(sel))
+            if out:
+                return out
+        except Exception:
+            continue
+
+    try:
+        for im in page.locator("img").all()[:40]:
+            try:
+                if not im.is_visible():
+                    continue
+                box = im.bounding_box()
+                if not box:
+                    continue
+                w, h = box.get("width", 0), box.get("height", 0)
+                if w < 55 or h < 22 or w > 400 or h > 200:
+                    continue
+                meta = ((im.get_attribute("src") or "") + (im.get_attribute("alt") or "")).lower()
+                if any(
+                    x in meta
+                    for x in (
+                        "logo",
+                        "escudo",
+                        "banner",
+                        "gobierno",
+                        "identificacion",
+                        "servicios-en-linea",
+                    )
+                ):
+                    continue
+                src_attr = (im.get_attribute("src") or "").strip()
+                if src_attr.startswith("data:image/") and "base64," in src_attr:
+                    return {"image_data_url": src_attr, "mime": "image/png"}
+                shot = im.screenshot()
+                if shot:
+                    return {"image_base64": base64.b64encode(shot).decode("ascii"), "mime": "image/png"}
+            except Exception:
+                continue
     except Exception:
         pass
+
+    # Captura del área del formulario de desafío (#ans = campo del código)
+    try:
+        if page.locator("#ans, input[name='answer']").count():
+            form = page.locator("form").first
+            if form.count() and form.is_visible():
+                shot = form.screenshot()
+                if shot:
+                    return {
+                        "image_base64": base64.b64encode(shot).decode("ascii"),
+                        "mime": "image/png",
+                        "capture": "form",
+                    }
+    except Exception:
+        pass
+
+    try:
+        if _is_rc_waf_or_non_jsf_shell_html(src) or _is_captcha_interstitial_html(src):
+            shot = page.screenshot(type="png", full_page=False)
+            if shot:
+                return {
+                    "image_base64": base64.b64encode(shot).decode("ascii"),
+                    "mime": "image/png",
+                    "capture": "viewport",
+                }
+    except Exception:
+        pass
+
     return {}
 
 
@@ -207,12 +299,28 @@ def _wait_challenge_pw(
         time.sleep(0.45)
 
     if not vis.get("image_data_url") and not vis.get("image_base64"):
-        while time.monotonic() < deadline:
-            if not _challenge_requires_user_in_browser(_content(page)):
-                return True
-            time.sleep(0.45)
+        to_client.put(
+            (
+                "log",
+                f"{phase}: desafío detectado pero no se extrajo la imagen; reintentando…",
+            )
+        )
+        page.wait_for_timeout(1500)
+        vis = _pw_captcha_visual(page)
+
+    if not vis.get("image_data_url") and not vis.get("image_base64"):
+        hint = _page_status_hint(_content(page))
+        to_client.put(
+            (
+                "error",
+                f"{phase}: {hint} — no se pudo enviar la imagen del captcha. "
+                "Prueba de nuevo o usa REGISTROCIVIL_COOKIE.",
+            )
+        )
         return False
 
+    cap_note = " (captura pantalla)" if vis.get("capture") else ""
+    to_client.put(("log", f"{phase}: imagen del desafío enviada a esta página{cap_note}."))
     to_client.put(("captcha", {"phase": phase, **vis}))
     while time.monotonic() < end:
         if ready():
