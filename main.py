@@ -121,8 +121,9 @@ def _resolve_ws_headless(requested: bool) -> tuple[bool, str | None]:
     if (os.environ.get("DISPLAY") or "").strip() or (os.environ.get("WAYLAND_DISPLAY") or "").strip():
         return False, None
     return True, (
-        "Sin pantalla en el servidor (Render/Docker): Playwright irá en headless. "
-        "reCAPTCHA no se puede marcar en ventana aquí; usa captcha-imagen en la web o cookie en .env."
+        "Sin pantalla ($DISPLAY): Playwright en headless. "
+        "Para reCAPTCHA en deploy: REGISTROCIVIL_WS_BROWSER_HEADLESS=false y "
+        "REGISTROCIVIL_USE_XVFB=true (Docker arranca Xvfb), o usa REGISTROCIVIL_COOKIE."
     )
 
 

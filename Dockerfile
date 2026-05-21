@@ -8,19 +8,21 @@ ENV PYTHONUNBUFFERED=1 \
     MPLBACKEND=Agg \
     REGISTROCIVIL_BUG_CLEAR_ON_START=false \
     REGISTROCIVIL_BROWSER_BACKEND=playwright \
-    REGISTROCIVIL_WS_BROWSER_HEADLESS=true
+    REGISTROCIVIL_WS_BROWSER_HEADLESS=true \
+    REGISTROCIVIL_USE_XVFB=false
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py ./
 COPY rc_*.py ./
-COPY entregar.sh start.sh cookie.rc.txt.example ./
+COPY entregar.sh start.sh docker-entrypoint.sh cookie.rc.txt.example ./
 
 # Carpetas vacías para escritura en runtime (Render disco efímero)
-RUN mkdir -p incoming salida bug && chmod +x entregar.sh start.sh 2>/dev/null || true
+RUN mkdir -p incoming salida bug \
+    && chmod +x entregar.sh start.sh docker-entrypoint.sh 2>/dev/null || true
 
 EXPOSE 10000
 
-# Render inyecta PORT; local usa 8765 por defecto
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8765}"]
+# Xvfb en entrypoint si USE_XVFB=true o WS_BROWSER_HEADLESS=false
+ENTRYPOINT ["./docker-entrypoint.sh"]
