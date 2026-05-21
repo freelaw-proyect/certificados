@@ -7,7 +7,8 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     MPLBACKEND=Agg \
     REGISTROCIVIL_BUG_CLEAR_ON_START=false \
-    REGISTROCIVIL_BROWSER_BACKEND=playwright
+    REGISTROCIVIL_BROWSER_BACKEND=playwright \
+    REGISTROCIVIL_WS_BROWSER_HEADLESS=true
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

@@ -7,6 +7,7 @@ y hay que resolver en la ventana del navegador (o usar REGISTROCIVIL_WS_BROWSER_
 
 from __future__ import annotations
 
+import os
 import queue
 import sys
 import time
@@ -358,6 +359,15 @@ def fetch_cookie_header_via_chrome_interactive(
     pack_list = list(pack_specs or [])
     if not pack_list and id_certificado:
         pack_list = [("certificado", id_certificado)]
+
+    if not headless and not (os.environ.get("DISPLAY") or "").strip():
+        headless = True
+        to_client.put(
+            (
+                "log",
+                "Sin $DISPLAY: forzando Chromium headless (obligatorio en Render/Docker).",
+            )
+        )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(

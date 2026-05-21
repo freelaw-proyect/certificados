@@ -111,6 +111,21 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+def _resolve_ws_headless(requested: bool) -> tuple[bool, str | None]:
+    """
+    En Render/Docker no hay X11 ($DISPLAY): headless=false rompe Playwright.
+    En Mac/local con DISPLAY se respeta ws_browser_headless=false.
+    """
+    if requested:
+        return True, None
+    if (os.environ.get("DISPLAY") or "").strip() or (os.environ.get("WAYLAND_DISPLAY") or "").strip():
+        return False, None
+    return True, (
+        "Sin pantalla en el servidor (Render/Docker): Playwright irá en headless. "
+        "reCAPTCHA no se puede marcar en ventana aquí; usa captcha-imagen en la web o cookie en .env."
+    )
+
+
 class EntregaCertificadoIn(BaseModel):
     """Cuerpo opcional: cookie de sesión RC (alternativa a cabecera o .env)."""
 
@@ -2110,7 +2125,7 @@ def entrega_certificado(
 
 
 def _root_html() -> str:
-    run = settings.default_run.strip() or "(define REGISTROCIVIL_DEFAULT_RUN)"
+    run_default = settings.default_run.strip()
     email = settings.default_email.strip() or "(define REGISTROCIVIL_DEFAULT_EMAIL)"
     if settings.default_pack_tres_certificados:
         cert = _pack_ui_label()
@@ -2131,6 +2146,8 @@ def _root_html() -> str:
       background: #fff8e6; border: 1px solid #e6c200; border-radius: 8px;
     }}
     #alertBox strong {{ display: block; margin-bottom: 0.35rem; }}
+    label {{ display: block; font-weight: 600; margin-bottom: 0.35rem; }}
+    #runRut {{ width: 100%; max-width: 22rem; padding: 0.55rem; font-size: 1.1rem; margin-bottom: 1rem; }}
     #captchaBox {{ display: none; margin: 1rem 0; padding: 1rem; border: 1px solid #ccc; border-radius: 8px; background: #fafafa; }}
     #captchaBox img {{ max-width: 100%; height: auto; border: 1px solid #888; display: block; margin-bottom: 0.75rem; }}
     #code {{ width: 100%; max-width: 22rem; padding: 0.55rem; font-size: 1.1rem; margin: 0.5rem 0; }}
@@ -2142,10 +2159,14 @@ def _root_html() -> str:
 </head>
 <body>
   <h1>Certificado Registro Civil</h1>
-  <p class="meta">RUN <code>{run}</code> · certificado <code>{cert}</code> · correo <code>{email}</code></p>
+  <p class="meta">Pack: <code>{cert}</code> · correo destino <code>{email}</code></p>
+  <p>
+    <label for="runRut">RUT de la persona (certificados a solicitar)</label>
+    <input type="text" id="runRut" name="run" placeholder="17.402.744-7" value="{run_default}" autocomplete="off"/>
+  </p>
   <p>
     Pulsa iniciar: si aparece la <strong>imagen del desafío</strong> abajo, escribe el código y envía.
-    Si es <strong>reCAPTCHA</strong>, complétalo en la ventana de Chromium que abre Playwright (no headless). Pack según .env; tipos que no apliquen al RUN no detienen el resto.
+    Si es <strong>reCAPTCHA</strong>, complétalo en Chromium (en servidor va en headless). Tipos del pack que no apliquen al RUN no detienen el resto.
   </p>
   <p><button type="button" id="go">Iniciar solicitud</button></p>
   <div id="captchaBox">
@@ -2171,6 +2192,7 @@ def _root_html() -> str:
     const alertBox = document.getElementById("alertBox");
     const alertText = document.getElementById("alertText");
     const goBtn = document.getElementById("go");
+    const runRutEl = document.getElementById("runRut");
     function log(msg, cls) {{
       const span = document.createElement("div");
       if (cls) span.className = cls;
@@ -2189,8 +2211,16 @@ def _root_html() -> str:
       ws = new WebSocket(url);
 
       ws.onopen = () => {{
-        log("Conectado. Abriendo navegador (Playwright/Selenium según .env)…");
+        const run = (runRutEl.value || "").trim();
+        if (!run) {{
+          log("Ingresa el RUT de la persona.", "err");
+          ws.close();
+          return;
+        }}
+        ws.send(JSON.stringify({{ type: "start", run }}));
+        log("RUN " + run + " — conectado, abriendo navegador…");
         goBtn.disabled = true;
+        runRutEl.disabled = true;
       }};
 
       ws.onmessage = (ev) => {{
@@ -2251,12 +2281,18 @@ def _root_html() -> str:
       ws.onclose = () => {{
         log("Conexión cerrada.");
         goBtn.disabled = false;
+        runRutEl.disabled = false;
         ws = null;
       }};
     }}
 
     goBtn.onclick = () => {{
       if (ws && ws.readyState <= 1) return;
+      if (!(runRutEl.value || "").trim()) {{
+        log("Ingresa el RUT antes de iniciar.", "err");
+        runRutEl.focus();
+        return;
+      }}
       logEl.textContent = "";
       alertBox.style.display = "none";
       capBox.style.display = "none";
@@ -2278,6 +2314,11 @@ def _root_html() -> str:
       capBox.style.display = "none";
       log("Continuando: si Chromium ya muestra el carrito, el flujo sigue solo…");
     }};
+
+    (function () {{
+      const q = new URLSearchParams(location.search).get("run");
+      if (q && !runRutEl.value) runRutEl.value = q;
+    }})();
   </script>
 </body>
 </html>"""
@@ -2298,19 +2339,42 @@ async def ws_entrega_certificado(websocket: WebSocket) -> None:
             return
     await websocket.accept()
 
-    run_raw = settings.default_run.strip()
+    try:
+        raw_start = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+        start_obj = json.loads(raw_start)
+    except asyncio.TimeoutError:
+        await websocket.send_json({"type": "error", "message": "Timeout: envía {type:'start', run:'...'} al conectar."})
+        await websocket.close()
+        return
+    except json.JSONDecodeError:
+        await websocket.send_json({"type": "error", "message": "Primer mensaje inválido; se esperaba JSON con type=start y run."})
+        await websocket.close()
+        return
+
+    if (start_obj.get("type") or "").strip() != "start":
+        await websocket.send_json({"type": "error", "message": "Primer mensaje debe ser type=start con el RUT."})
+        await websocket.close()
+        return
+
+    run_raw = (start_obj.get("run") or start_obj.get("rut") or "").strip() or settings.default_run.strip()
     run, run_normalizado_aviso = _normalize_run_for_rc(run_raw)
     email = settings.default_email.strip()
     numero = settings.default_numero_documento_sol.strip()
-    if not (run and email and numero):
+    if not run:
+        await websocket.send_json({"type": "error", "message": "Ingresa el RUT de la persona en el formulario."})
+        await websocket.close()
+        return
+    if not (email and numero):
         await websocket.send_json(
             {
                 "type": "error",
-                "message": "Define REGISTROCIVIL_DEFAULT_RUN, DEFAULT_EMAIL y DEFAULT_NUMERO_DOCUMENTO_SOL en .env",
+                "message": "Define REGISTROCIVIL_DEFAULT_EMAIL y REGISTROCIVIL_DEFAULT_NUMERO_DOCUMENTO_SOL en .env",
             }
         )
         await websocket.close()
         return
+    if run_normalizado_aviso:
+        await websocket.send_json({"type": "log", "message": run_normalizado_aviso})
     aviso_ndoc = _aviso_numero_documento_invalido(run, numero)
     if aviso_ndoc:
         await websocket.send_json({"type": "error", "message": aviso_ndoc})
@@ -2333,6 +2397,9 @@ async def ws_entrega_certificado(websocket: WebSocket) -> None:
         headless = settings.ws_browser_headless
         if backend == "selenium":
             headless = settings.ws_selenium_headless
+        headless, headless_note = _resolve_ws_headless(headless)
+        if headless_note:
+            to_client.put(("log", headless_note))
         try:
             if backend == "playwright":
                 from rc_playwright_ws import fetch_cookie_header_via_chrome_interactive as fetch_session
@@ -2478,6 +2545,7 @@ async def ws_entrega_certificado(websocket: WebSocket) -> None:
     run_consulta = settings.default_carro_run_consulta.strip() or run
     run_solicitante = settings.default_carro_run_solicitante.strip() or run
     filtro = settings.default_filtro.strip()
+    await websocket.send_json({"type": "log", "message": f"Solicitud para RUN {run} → {email}"})
     try:
         payload = await asyncio.to_thread(
             _http_entrega_phase,
