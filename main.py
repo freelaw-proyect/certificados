@@ -144,6 +144,19 @@ def _local_gui_available() -> bool:
     )
 
 
+def _is_remote_deploy() -> bool:
+    """Render y otros PaaS: el RC suele bloquear Chromium nuevo (WAF); usar cookie subida desde local."""
+    return bool(
+        (os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID") or "").strip()
+        or (os.environ.get("REGISTROCIVIL_REMOTE_DEPLOY") or "").strip().lower()
+        in ("true", "1", "yes")
+    )
+
+
+def _public_api_base_from_ws_url(ws_url: Any) -> str:
+    return str(ws_url).replace("wss:", "https:").replace("ws:", "http:").split("/ws/")[0].rstrip("/")
+
+
 def _resolve_ws_headless(requested: bool) -> tuple[bool, str | None]:
     """
     En Render/Docker Linux sin $DISPLAY: headless=false rompe Playwright.
@@ -2647,18 +2660,22 @@ async def ws_entrega_certificado(websocket: WebSocket) -> None:
             pass
         return
 
-    if (os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID") or "").strip():
+    if _is_remote_deploy():
+        api_base = _public_api_base_from_ws_url(websocket.url)
+        token_hint = " --token <REGISTROCIVIL_SESSION_TOKEN>" if _session_api_token() else ""
         await websocket.send_json(
             {
-                "type": "log",
+                "type": "error",
                 "message": (
-                    "Sin cookie en el servidor: en tu Mac ejecuta "
-                    "python scripts/registrocivil_cookie_local.py --api-url "
-                    + str(websocket.url).replace("wss:", "https:").replace("ws:", "http:").split("/ws/")[0]
-                    + " (abre Chrome, resuelve captcha, sube sesión). Luego pulsa Iniciar de nuevo."
+                    "En Render el Registro Civil bloquea Chromium automático (WAF «Oops…»). "
+                    "No se abrirá navegador en el servidor. En tu Mac ejecuta:\n"
+                    f"  python scripts/registrocivil_cookie_local.py --api-url {api_base}{token_hint}\n"
+                    f"Comprueba GET {api_base}/registrocivil/session (has_session: true) y pulsa Iniciar de nuevo."
                 ),
             }
         )
+        await websocket.close()
+        return
 
     to_client: queue.Queue[tuple[str, Any]] = queue.Queue()
     from_client: queue.Queue[tuple[str, Any]] = queue.Queue()

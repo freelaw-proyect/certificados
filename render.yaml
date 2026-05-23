@@ -18,5 +18,8 @@ services:
         value: "true"
       - key: REGISTROCIVIL_APP_ENV
         value: prod
-      # Añade: REGISTROCIVIL_SESSION_TOKEN, DEFAULT_RUN, DEFAULT_EMAIL (@email2json.com), etc.
-      # Cookie dinámica: script local → POST /registrocivil/session (ver scripts/registrocivil_cookie_local.py)
+      # Obligatorio en Render (WAF bloquea Chromium en el servidor):
+      # - REGISTROCIVIL_SESSION_TOKEN (secreto)
+      # - REGISTROCIVIL_PUBLIC_URL=https://certificados-xxx.onrender.com
+      # - DEFAULT_RUN, DEFAULT_EMAIL (@email2json.com), DEFAULT_NUMERO_DOCUMENTO_SOL
+      # En tu Mac: python scripts/registrocivil_cookie_local.py --api-url $REGISTROCIVIL_PUBLIC_URL --token $REGISTROCIVIL_SESSION_TOKEN
