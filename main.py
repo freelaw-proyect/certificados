@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     # Opcional: ruta a archivo con una línea Cookie (si REGISTROCIVIL_COOKIE está vacío).
     cookie_file: str = ""
     default_run: str = ""
+    # dev | prod | local — en dev el RC envía a dev_default_email (Gmail), no al inbox email2json.
+    app_env: str = "dev"
+    dev_default_email: str = "freelaw.tech@gmail.com"
     default_email: str = ""
     default_numero_documento_sol: str = ""
     default_carro_run_consulta: str = ""
@@ -115,15 +118,40 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+_DEV_APP_ENVS = frozenset({"dev", "development", "local"})
+
+
+def _is_dev_app_env() -> bool:
+    return settings.app_env.strip().lower() in _DEV_APP_ENVS
+
+
+def _entrega_email() -> str:
+    """Correo efectivo en el POST de entrega al Registro Civil."""
+    if _is_dev_app_env():
+        dev = settings.dev_default_email.strip()
+        if dev:
+            return dev
+    return settings.default_email.strip()
+
+
+def _local_gui_available() -> bool:
+    """Mac/Windows no usan $DISPLAY; Linux sí (o Xvfb en Docker)."""
+    if sys.platform in ("darwin", "win32"):
+        return True
+    return bool(
+        (os.environ.get("DISPLAY") or "").strip()
+        or (os.environ.get("WAYLAND_DISPLAY") or "").strip()
+    )
+
 
 def _resolve_ws_headless(requested: bool) -> tuple[bool, str | None]:
     """
-    En Render/Docker no hay X11 ($DISPLAY): headless=false rompe Playwright.
-    En Mac/local con DISPLAY se respeta ws_browser_headless=false.
+    En Render/Docker Linux sin $DISPLAY: headless=false rompe Playwright.
+    En Mac/Windows se respeta ws_browser_headless=false (ventana visible).
     """
     if requested:
         return True, None
-    if (os.environ.get("DISPLAY") or "").strip() or (os.environ.get("WAYLAND_DISPLAY") or "").strip():
+    if _local_gui_available():
         return False, None
     return True, (
         "Sin pantalla ($DISPLAY): Playwright en headless. "
@@ -1651,7 +1679,7 @@ def _run_one_certificate_flow(
     if not (entrega_body.get("carro_email") or "").strip():
         meta = {
             "id_certificado": id_certificado.strip(),
-            "hint": "El POST de entrega iría sin correo: revisa REGISTROCIVIL_DEFAULT_EMAIL en .env.",
+            "hint": "El POST de entrega iría sin correo: revisa REGISTROCIVIL_APP_ENV y el email de entrega en .env.",
             "entrega_total_fields": len(entrega_body),
             "carro_tiene_items": tiene_items,
         }
@@ -1896,6 +1924,13 @@ async def _lifespan(app: FastAPI):
         configure_persist_path(path)
         if load_from_disk(path):
             print(f"[registrocivil] Sesión RC cargada desde {path}", file=sys.stderr, flush=True)
+    entrega = _entrega_email()
+    modo = "dev" if _is_dev_app_env() else settings.app_env.strip() or "prod"
+    print(
+        f"[registrocivil] APP_ENV={modo} entrega_email={entrega!r}",
+        file=sys.stderr,
+        flush=True,
+    )
     yield
 
 
@@ -1904,7 +1939,12 @@ app = FastAPI(title="certificados", version="0.1.0", lifespan=_lifespan)
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    entrega = _entrega_email()
+    return {
+        "status": "ok",
+        "app_env": settings.app_env.strip() or "dev",
+        "entrega_email": entrega or "(sin correo de entrega)",
+    }
 
 
 @app.get("/registrocivil/session")
@@ -1994,8 +2034,22 @@ def email2json_setup(request: Request) -> dict[str, Any]:
     Instrucciones para configurar https://www.email2json.com/
     (correo *@email2json.com → webhook POST JSON a este servicio).
     """
+    entrega = _entrega_email()
+    if _is_dev_app_env():
+        return {
+            "modo": "dev",
+            "app_env": settings.app_env.strip() or "dev",
+            "entrega_email_efectivo": entrega,
+            "nota": (
+                "En dev el Registro Civil envía a REGISTROCIVIL_DEV_DEFAULT_EMAIL "
+                "(por defecto freelaw.tech@gmail.com). No hace falta webhook ni ngrok."
+            ),
+            "registrocivil_default_email_config": settings.default_email.strip()
+            or "(solo usado en prod)",
+        }
     inbox_email = settings.default_email.strip()
     return {
+        "modo": "prod",
         "email2json": "https://www.email2json.com/",
         "pasos": [
             "En email2json.com crea un webhook apuntando a webhook_url (URL pública; en local usa ngrok/cloudflared).",
@@ -2004,6 +2058,7 @@ def email2json_setup(request: Request) -> dict[str, Any]:
             f"Opcional: REGISTROCIVIL_EMAIL2JSON_WEBHOOK_TOKEN y el mismo valor en ?token= del webhook.",
         ],
         "webhook_url": _email2json_webhook_url(request),
+        "entrega_email_efectivo": entrega,
         "registrocivil_default_email": inbox_email or "(define REGISTROCIVIL_DEFAULT_EMAIL)",
         "inbox_guardado_en": str(_email2json_inbox_path()),
         "nota": "Los primeros 50 correos en email2json son gratis; luego plan de pago en su sitio.",
@@ -2122,12 +2177,13 @@ async def arbol_certificados(
         raise HTTPException(status_code=400, detail=msg)
 
     run_seed, _ = _normalize_run_for_rc(settings.default_run.strip())
-    email = settings.default_email.strip()
+    email = _entrega_email()
     numero = settings.default_numero_documento_sol.strip()
     if not skip_rc and not (email and numero):
         raise HTTPException(
             status_code=400,
-            detail="Define REGISTROCIVIL_DEFAULT_EMAIL y REGISTROCIVIL_DEFAULT_NUMERO_DOCUMENTO_SOL",
+            detail="Define correo de entrega (dev: REGISTROCIVIL_DEV_DEFAULT_EMAIL; prod: "
+            "REGISTROCIVIL_DEFAULT_EMAIL) y REGISTROCIVIL_DEFAULT_NUMERO_DOCUMENTO_SOL",
         )
     aviso = _aviso_numero_documento_invalido(run_seed, numero)
     if not skip_rc and aviso:
@@ -2211,17 +2267,18 @@ def entrega_certificado(
     `REGISTROCIVIL_COOKIE` o `REGISTROCIVIL_COOKIE_FILE` → Selenium si `USE_SELENIUM=true`.
 
     Con cookie válida ejecuta carro → agregar → carro → OrdenDeCompra → entregadocumentos
-    (correo en `REGISTROCIVIL_DEFAULT_EMAIL`) → entregadocumentosfreePagado.
+    (correo según APP_ENV: dev → REGISTROCIVIL_DEV_DEFAULT_EMAIL; prod → REGISTROCIVIL_DEFAULT_EMAIL)
+    → entregadocumentosfreePagado.
     """
     run_raw = settings.default_run.strip()
     run, run_normalizado_aviso = _normalize_run_for_rc(run_raw)
-    email = settings.default_email.strip()
+    email = _entrega_email()
     numero = settings.default_numero_documento_sol.strip()
     if not (run and email and numero):
         raise HTTPException(
             status_code=400,
-            detail="Define REGISTROCIVIL_DEFAULT_RUN, REGISTROCIVIL_DEFAULT_EMAIL y "
-            "REGISTROCIVIL_DEFAULT_NUMERO_DOCUMENTO_SOL en .env",
+            detail="Define REGISTROCIVIL_DEFAULT_RUN, correo de entrega (dev/prod vía "
+            "REGISTROCIVIL_APP_ENV) y REGISTROCIVIL_DEFAULT_NUMERO_DOCUMENTO_SOL en .env",
         )
 
     body_cookie = (payload.cookie if payload else None) or None
@@ -2270,7 +2327,8 @@ def entrega_certificado(
 
 def _root_html() -> str:
     run_default = settings.default_run.strip()
-    email = settings.default_email.strip() or "(define REGISTROCIVIL_DEFAULT_EMAIL)"
+    email = _entrega_email() or "(sin correo: revisa REGISTROCIVIL_APP_ENV y email de entrega)"
+    env_label = "dev" if _is_dev_app_env() else (settings.app_env.strip() or "prod")
     api_public = (
         (os.environ.get("REGISTROCIVIL_PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "")
         .strip()
@@ -2309,7 +2367,7 @@ def _root_html() -> str:
 </head>
 <body>
   <h1>Certificado Registro Civil</h1>
-  <p class="meta">Pack: <code>{cert}</code> · correo destino <code>{email}</code></p>
+  <p class="meta">Entorno <code>{env_label}</code> · pack <code>{cert}</code> · correo destino <code>{email}</code></p>
   <p>
     <label for="runRut">RUT de la persona (certificados a solicitar)</label>
     <input type="text" id="runRut" name="run" placeholder="17.402.744-7" value="{run_default}" autocomplete="off"/>
@@ -2521,7 +2579,7 @@ async def ws_entrega_certificado(websocket: WebSocket) -> None:
 
     run_raw = (start_obj.get("run") or start_obj.get("rut") or "").strip() or settings.default_run.strip()
     run, run_normalizado_aviso = _normalize_run_for_rc(run_raw)
-    email = settings.default_email.strip()
+    email = _entrega_email()
     numero = settings.default_numero_documento_sol.strip()
     if not run:
         await websocket.send_json({"type": "error", "message": "Ingresa el RUT de la persona en el formulario."})
@@ -2531,7 +2589,8 @@ async def ws_entrega_certificado(websocket: WebSocket) -> None:
         await websocket.send_json(
             {
                 "type": "error",
-                "message": "Define REGISTROCIVIL_DEFAULT_EMAIL y REGISTROCIVIL_DEFAULT_NUMERO_DOCUMENTO_SOL en .env",
+                "message": "Define correo de entrega (REGISTROCIVIL_APP_ENV=dev usa "
+                "REGISTROCIVIL_DEV_DEFAULT_EMAIL) y REGISTROCIVIL_DEFAULT_NUMERO_DOCUMENTO_SOL en .env",
             }
         )
         await websocket.close()

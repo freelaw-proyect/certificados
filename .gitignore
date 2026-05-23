@@ -1,4 +1,8 @@
 .env
+# Playwright: por defecto va a ~/Library/Caches/ms-playwright (Mac), no al repo.
+# Si defines PLAYWRIGHT_BROWSERS_PATH=.playwright-browsers en .env, ignóralo aquí:
+.playwright-browsers/
+ms-playwright/
 cookie.rc.txt
 session.rc.json
 incoming/
